@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 
+	"github.com/hashicorp/go-uuid"
 	"github.com/kong/go-kong/kong"
 	"github.com/kong/kubernetes-ingress-controller/pkg/adminapi"
 	"github.com/kong/kubernetes-ingress-controller/pkg/sendconfig"
@@ -18,9 +19,11 @@ import (
 	"github.com/kong/kubernetes-ingress-controller/railgun/controllers"
 	"github.com/kong/kubernetes-ingress-controller/railgun/controllers/configuration"
 	kongctrl "github.com/kong/kubernetes-ingress-controller/railgun/controllers/configuration"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,6 +46,7 @@ type Config struct {
 	SecretName           string
 	SecretNamespace      string
 	KubeconfigPath       string
+	AnonymousReports     bool
 
 	KongAdminAPIConfig adminapi.HTTPClientOpts
 
@@ -75,6 +79,7 @@ func MakeFlagSetFor(c *Config) *pflag.FlagSet {
 	flagSet.StringVar(&c.SecretName, "secret-name", "kong-config", "TODO")
 	flagSet.StringVar(&c.SecretNamespace, "secret-namespace", controllers.DefaultNamespace, "TODO")
 	flagSet.StringVar(&c.KubeconfigPath, "kubeconfig", "", "Path to the kubeconfig file.")
+	flagSet.BoolVar(&c.AnonymousReports, "anonymous-reports", true, `Send anonymized usage data to help improve Kong`)
 
 	flagSet.BoolVar(&c.KongAdminAPIConfig.TLSSkipVerify, "kong-admin-tls-skip-verify", false,
 		"Disable verification of TLS certificate of Kong's Admin endpoint.")
@@ -312,6 +317,57 @@ func Run(ctx context.Context, c *Config) error {
 	}
 	if err := mgr.AddReadyzCheck("check", healthz.Ping); err != nil {
 		return fmt.Errorf("unable to setup readyz: %w", err)
+	}
+
+	// if anonymous reports are enabled this helps provide Kong with insights about usage of the ingress controller
+	// which is non-sensitive and predominantly informs us of the controller and cluster versions in use.
+	// This data helps inform us what versions, features, e.t.c. end-users are actively using which helps to inform
+	// our prioritization of work and we appreciate when our end-users provide them, however if you do feel
+	// uncomfortable and would rather turn them off run the controller with the "--anonymous-reports false" flag.
+	reporterLogger := logrus.StandardLogger()
+	if c.AnonymousReports {
+		reporterLogger.Info("running anonymous reports")
+
+		// record the system hostname
+		hostname, err := os.Hostname()
+		if err != nil {
+			reporterLogger.Error(err, "failed to fetch hostname")
+		}
+
+		// create a universal unique identifer for this system
+		uuid, err := uuid.GenerateUUID()
+		if err != nil {
+			reporterLogger.Error(err, "failed to generate a random uuid")
+		}
+
+		// record the current Kubernetes server version
+		kc, err := kubernetes.NewForConfig(kubeconfig)
+		if err != nil {
+			reporterLogger.Error(err, "could not create client-go for Kubernetes discovery")
+		}
+		k8sVersion, err := kc.Discovery().ServerVersion()
+		if err != nil {
+			reporterLogger.Error(err, "failed to fetch k8s api-server version")
+		}
+
+		// build the final report
+		info := util.Info{
+			KongVersion:       "FIXME",
+			KICVersion:        "FIXME",
+			KubernetesVersion: k8sVersion.String(),
+			Hostname:          hostname,
+			ID:                uuid,
+			KongDB:            "FIXME",
+		}
+
+		// run the reporter in the background
+		reporter := util.Reporter{
+			Info:   info,
+			Logger: reporterLogger,
+		}
+		go reporter.Run(ctx.Done())
+	} else {
+		reporterLogger.Info("anonymous reports have been disabled, skipping")
 	}
 
 	setupLog.Info("starting manager")
